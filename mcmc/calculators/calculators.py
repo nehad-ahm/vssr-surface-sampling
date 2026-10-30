@@ -817,3 +817,111 @@ class LAMMPSRunSurfCalc(LAMMPSRun):
 
         if "surface_energy" in properties:
             self.results["surface_energy"] = self.get_surface_energy(atoms=atoms)
+
+from ase.calculators.calculator import Calculator, all_changes
+
+
+def compute_surface_energy(
+    energy: float,
+    symbols: list[str],
+    chem_pots: dict,
+    offset_data: dict,
+    offset_units: str = "eV",
+) -> float:
+    """Calculator-agnostic version of EnsembleNFFSurface.get_surface_energy."""
+    counts = Counter(symbols)
+    bulk_energies = offset_data["bulk_energies"]
+    stoics = offset_data["stoics"]
+    ref_formula = offset_data["ref_formula"]
+    ref_element = offset_data["ref_element"]
+
+    bulk_ref_en = counts[ref_element] * bulk_energies[ref_formula]
+    pot = 0.0
+    for ele in counts:
+        if ele == ref_element:
+            continue
+        dev = counts[ele] - stoics[ele] / stoics[ref_element] * counts[ref_element]
+        bulk_ref_en += dev * bulk_energies[ele]
+        pot += dev * chem_pots[ele]
+
+    if offset_units == "atomic":
+        bulk_ref_en *= HARTREE_TO_EV
+    return energy - bulk_ref_en - pot
+
+
+def build_base_calc(spec, **kwargs) -> Calculator:
+    """Resolve an externally supplied calculator.
+
+    spec can be an ASE Calculator instance, a zero-arg callable returning one,
+    "mace_mp" / "mace_mp:medium" (foundation model), or a path to a MACE model file.
+    """
+    if isinstance(spec, Calculator):
+        return spec
+    if callable(spec):
+        return spec()
+    if isinstance(spec, str):
+        from mace.calculators import MACECalculator, mace_mp
+
+        if spec.startswith("mace_mp"):
+            model = spec.split(":", 1)[1] if ":" in spec else "medium"
+            return mace_mp(model=model, **kwargs)
+        return MACECalculator(model_paths=spec, **kwargs)
+    raise TypeError(f"Cannot build a calculator from {type(spec)}")
+
+
+class SurfaceCalcWrapper(Calculator):
+    """Wrap any ASE calculator and add 'surface_energy' to its results."""
+
+    name = "surface_wrapper"
+    implemented_properties = ("energy", "free_energy", "forces", "stress", "surface_energy")
+
+    def __init__(
+        self,
+        base_calc,
+        chem_pots: dict | None = None,
+        offset_data: dict | None = None,
+        offset_units: str = "eV",  # MACE outputs eV; use "atomic" only for NFF-style offsets
+        calc_kwargs: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.base_calc = build_base_calc(base_calc, **(calc_kwargs or {}))
+        self.chem_pots = chem_pots or {}
+        self.offset_data = offset_data or {}
+        self.offset_units = offset_units
+        self.logger = logging.getLogger(__name__)
+
+    def set(self, **kwargs) -> dict:
+        changed = Calculator.set(self, **kwargs)
+        for key in ("chem_pots", "offset_data", "offset_units"):
+            if key in self.parameters:
+                setattr(self, key, self.parameters[key])
+        return changed
+
+    def calculate(self, atoms=None, properties=("energy",), system_changes=all_changes):
+        Calculator.calculate(self, atoms, properties, system_changes)
+
+        # Only request what the base calculator supports; energy is always needed
+        base_props = {p for p in properties if p in self.base_calc.implemented_properties}
+        base_props.add("energy")
+        for prop in base_props:
+            # get_property handles the base calc's own caching and calculate() call
+            self.results[prop] = self.base_calc.get_property(prop, self.atoms)
+
+        # Carry over extras (e.g. MACE ensemble outputs like energy_var, forces_comm)
+        for key, val in self.base_calc.results.items():
+            self.results.setdefault(key, val)
+
+        if "surface_energy" in properties:
+            if not self.chem_pots or not self.offset_data:
+                raise ValueError("chem_pots and offset_data must be set for surface_energy")
+            self.results["surface_energy"] = compute_surface_energy(
+                self.results["energy"],
+                self.atoms.get_chemical_symbols(),
+                self.chem_pots,
+                self.offset_data,
+                self.offset_units,
+            )
+
+        if hasattr(atoms, "results"):  # AtomsBatch has this, plain ase.Atoms does not
+            atoms.results.update(self.results)
