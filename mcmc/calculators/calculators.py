@@ -402,9 +402,8 @@ class EnsembleNFFSurface(EnsembleNFF):
         if atoms is None:
             atoms = self.atoms
 
-        if chem_pots is None and self.chem_pots is not None:
-            chem_pots = self.chem_pots
-        else:
+        chem_pots = self.chem_pots if chem_pots is None else chem_pots
+        if not chem_pots:
             raise ValueError("chemical potentials are not set")
 
         if offset_data is None and self.offset_data is not None:
