@@ -182,6 +182,7 @@ class MCMC:
             # Perform semi-grand canonical until num_ads_atoms are obtained
             while self.surface.num_adsorbates < self.num_ads_atoms:
                 self.step_semigrand()
+                self.logger.info("Canonical init: %d / %d adsorbates", self.surface.num_adsorbates, self.num_ads_atoms)
 
         self.surface.real_atoms.write(
             self.run_folder / f"{self.surface.surface_name}_canonical_init.cif"
